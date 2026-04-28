@@ -6,6 +6,8 @@ import hashlib
 import base64
 import secrets
 import time
+import subprocess
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -124,23 +126,26 @@ def make_request(method: str, endpoint: str, **kwargs) -> requests.Response:
 
 # Local call back server
 class CallbackHandler(BaseHTTPRequestHandler):
-    """
-    Temporary local HTTP server that catches the
-    GitHub OAuth callback and extracts the code + state.
-    """
-    code  = None
+    code = None
     state = None
+    access_token  = None
+    refresh_token = None
+    user  = None
 
     def do_GET(self):
-        # Parse the callback URL
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
-        # Extract code and state
-        CallbackHandler.code  = params.get("code",  [None])[0]
-        CallbackHandler.state = params.get("state", [None])[0]
+        CallbackHandler.state         = params.get("state",         [None])[0]
+        CallbackHandler.access_token  = params.get("access_token",  [None])[0]
+        CallbackHandler.refresh_token = params.get("refresh_token", [None])[0]
+        CallbackHandler.user          = {
+            "username"  : params.get("username",   [None])[0],
+            "email"     : params.get("email",      [None])[0],
+            "role"      : params.get("role",       [None])[0],
+            "avatar_url": params.get("avatar_url", [None])[0],
+        }
 
-        # Send a nice response to the browser
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
@@ -154,8 +159,9 @@ class CallbackHandler(BaseHTTPRequestHandler):
         """)
 
     def log_message(self, format, *args):
-        # Suppress server logs
         pass
+
+    
 
 
 # ──────────────────────────────────────────
@@ -194,7 +200,18 @@ def login():
     )
 
     # Open browser
-    webbrowser.open(auth_url)
+    try:
+        # Suppress xdg-open error messages
+        opened = webbrowser.open(auth_url)
+        if not opened:
+            raise Exception("No browser found")
+    except Exception:
+        pass
+    finally:
+        console.print(
+            f"\n[yellow]Open this URL in your browser to login:[/yellow]\n\n"
+            f"[bold cyan]{auth_url}[/bold cyan]\n"
+        )
 
     # Run server in a thread so it doesn't block
     server_thread = threading.Thread(target=server.handle_request)
