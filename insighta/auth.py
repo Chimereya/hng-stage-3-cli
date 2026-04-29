@@ -6,10 +6,8 @@ import hashlib
 import base64
 import secrets
 import time
-import subprocess
-import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 from .config import (
     API_URL,
@@ -19,7 +17,7 @@ from .config import (
     get_access_token,
     get_refresh_token,
     update_tokens,
-    is_logged_in
+    is_logged_in,
 )
 from .display import (
     console,
@@ -27,27 +25,51 @@ from .display import (
     print_error,
     print_info,
     print_user,
-    Loader
+    Loader,
 )
 
 
+# ──────────────────────────────────────────
+# PKCE HELPERS
+# ──────────────────────────────────────────
 
 def generate_pkce_pair():
-    """
-    This Generates a code_verifier and code_challenge pair.
-    The CLI will generate its own PKCE.
-    """
-    code_verifier  = secrets.token_urlsafe(64)
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode()).digest()
-    ).rstrip(b"=").decode()
+    """Generate a code_verifier and code_challenge pair (PKCE S256)."""
+    import string
+    allowed_chars = string.ascii_letters + string.digits + '._~-'
+    code_verifier = ''.join(secrets.choice(allowed_chars) for _ in range(43))
+    code_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
     return code_verifier, code_challenge
 
 
+# ──────────────────────────────────────────
+# TOKEN EXCHANGE
+# ──────────────────────────────────────────
 
-
-def refresh_access_token() -> bool:
-   
+def exchange_code_for_tokens(code: str, code_verifier: str) -> dict | None:
+    """Exchange authorization code for access tokens using PKCE."""
+    try:
+        response = requests.post(
+            f"{API_URL}/auth/token",
+            json={
+                "code": code,
+                "code_verifier": code_verifier,
+                "grant_type": "authorization_code",
+            },
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except requests.exceptions.RequestException:
+        return None
+    """Try to refresh the access token using the stored refresh token."""
     refresh_token = get_refresh_token()
     if not refresh_token:
         return False
@@ -56,31 +78,26 @@ def refresh_access_token() -> bool:
         response = requests.post(
             f"{API_URL}/auth/refresh",
             json={"refresh_token": refresh_token},
-            timeout=10
+            timeout=10,
         )
-
         if response.status_code == 200:
             data = response.json()
-            access_token = data["access_token"]
-            refresh_token = data["refresh_token"]
-            update_tokens(access_token, refresh_token)
+            update_tokens(data["access_token"], data["refresh_token"])
             return True
-
         return False
-
     except requests.exceptions.RequestException:
         return False
 
 
-
+# ──────────────────────────────────────────
 # AUTHENTICATED REQUEST
+# ──────────────────────────────────────────
 
 def make_request(method: str, endpoint: str, **kwargs) -> requests.Response:
     """
-    Makes an authenticated request to the backend.
-    Automatically refreshes the token if expired (that is 401).
-    Prompts re-login if refresh also fails.
-
+    Make an authenticated request to the backend.
+    Automatically refreshes the token on 401 and retries once.
+    Exits with a helpful message if refresh also fails.
     """
     access_token = get_access_token()
 
@@ -89,79 +106,96 @@ def make_request(method: str, endpoint: str, **kwargs) -> requests.Response:
         raise SystemExit(1)
 
     headers = {
-        "Authorization" : f"Bearer {access_token}",
-        "X-API-Version" : "1",
-        **kwargs.pop("headers", {})
+        "Authorization": f"Bearer {access_token}",
+        "X-API-Version": "1",
+        **kwargs.pop("headers", {}),
     }
 
     response = requests.request(
         method,
         f"{API_URL}{endpoint}",
         headers=headers,
-        **kwargs
+        **kwargs,
     )
 
-    # Token expired : trying to refresh
+    # Token expired — try to refresh and retry once
     if response.status_code == 401:
-        print_info("Token expired, refreshing...")
-
+        print_info("Session expired, refreshing token...")
         if refresh_access_token():
-            # Retry with new token
             headers["Authorization"] = f"Bearer {get_access_token()}"
             response = requests.request(
                 method,
                 f"{API_URL}{endpoint}",
                 headers=headers,
-                **kwargs
+                **kwargs,
             )
         else:
-            # Refresh also failed so the user is logged out
             print_error("Session expired. Please run: insighta login")
             raise SystemExit(1)
 
     return response
 
 
+# ──────────────────────────────────────────
+# LOCAL CALLBACK SERVER (thread‑safe)
+# ──────────────────────────────────────────
+
+class CallbackResult:
+    """Thread‑safe container for OAuth callback data."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.access_token = None
+        self.refresh_token = None
+        self.state = None
+        self.user = {}
+        self.received = False
 
 
-# Local call back server
 class CallbackHandler(BaseHTTPRequestHandler):
-    code = None
-    state = None
-    access_token  = None
-    refresh_token = None
-    user  = None
+    """
+    Temporary local HTTP server that catches the GitHub OAuth callback
+    and extracts the tokens forwarded by the backend in the redirect URL.
+    """
+    # These class attributes will be set before server start
+    result: CallbackResult = None
+    expected_state: str = None
 
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        # Only process /callback; ignore other requests
+        if parsed.path != "/callback":
+            self.send_response(204)
+            self.end_headers()
+            return
+
         params = parse_qs(parsed.query)
 
-        CallbackHandler.state         = params.get("state",         [None])[0]
-        CallbackHandler.access_token  = params.get("access_token",  [None])[0]
-        CallbackHandler.refresh_token = params.get("refresh_token", [None])[0]
-        CallbackHandler.user          = {
-            "username"  : params.get("username",   [None])[0],
-            "email"     : params.get("email",      [None])[0],
-            "role"      : params.get("role",       [None])[0],
-            "avatar_url": params.get("avatar_url", [None])[0],
-        }
+        with CallbackHandler.result.lock:
+            CallbackHandler.result.state = params.get("state", [None])[0]
+            CallbackHandler.result.access_token = params.get("access_token", [None])[0]
+            CallbackHandler.result.refresh_token = params.get("refresh_token", [None])[0]
+            CallbackHandler.result.user = {
+                "username": params.get("username", [None])[0],
+                "email": params.get("email", [None])[0],
+                "role": params.get("role", [None])[0],
+                "avatar_url": params.get("avatar_url", [None])[0],
+            }
+            CallbackHandler.result.received = True
 
+        # Send a nice response to the browser
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"""
-            <html>
-            <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-                <h2>Authentication Successful!</h2>
-                <p>You can close this tab and return to your terminal.</p>
-            </body>
-            </html>
-        """)
+        self.wfile.write(
+            b"""<html><body style="font-family:sans-serif;text-align:center;padding:60px;">
+                   <h2>&#10003; Authentication Successful!</h2>
+                   <p>You can close this tab and return to your terminal.</p>
+               </body></html>"""
+        )
 
     def log_message(self, format, *args):
-        pass
-
-    
+        pass  # Suppress server logs
 
 
 # ──────────────────────────────────────────
@@ -171,98 +205,89 @@ class CallbackHandler(BaseHTTPRequestHandler):
 @click.command()
 def login():
     """Login to Insighta via GitHub OAuth."""
-
     if is_logged_in():
         creds = load_credentials()
-        user  = creds.get("user", {})
-        print_info(f"Already logged in as @{user.get('username', 'unknown')}")
+        username = creds.get("user", {}).get("username", "unknown")
+        print_info(f"Already logged in as @{username}")
         print_info("Run 'insighta logout' first to switch accounts.")
         return
 
-    # Generate PKCE pair
+    # Generate PKCE + state
     code_verifier, code_challenge = generate_pkce_pair()
     state = secrets.token_urlsafe(32)
 
-    # Start local callback server on port 8484
+    # Prepare thread‑safe result container
+    result = CallbackResult()
+    CallbackHandler.result = result
+
     PORT = 8484
     server = HTTPServer(("localhost", PORT), CallbackHandler)
+    server.socket.settimeout(1.0)  # Low timeout so we can check for shutdown frequently
+    server.timeout = 1.0
 
-    print_info("Starting local callback server...")
-    print_info("Opening GitHub login page in your browser...")
+    # Build the auth URL (backend must support source=cli and PKCE)
+    query_params = {
+        "source": "cli",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"{API_URL}/auth/github?{urlencode(query_params)}"
 
-    # Build the GitHub auth URL pointing to backend
-    auth_url = (
-        f"{API_URL}/auth/github"
-        f"?source=cli"
-        f"&state={state}"
-        f"&code_challenge={code_challenge}"
-        f"&code_challenge_method=S256"
-    )
-
-    # Open browser
-    try:
-        # Suppress xdg-open error messages
-        opened = webbrowser.open(auth_url)
-        if not opened:
-            raise Exception("No browser found")
-    except Exception:
-        pass
-    finally:
+    # Try to open in browser; if fails, print the URL clearly
+    opened = webbrowser.open(auth_url)
+    if not opened:
+        print_info("Could not open browser automatically.")
         console.print(
-            f"\n[yellow]Open this URL in your browser to login:[/yellow]\n\n"
+            "\n[bold yellow]Please open the following URL in your browser:[/bold yellow]\n"
             f"[bold cyan]{auth_url}[/bold cyan]\n"
         )
+    else:
+        console.print(
+            "\n[bold cyan]A browser window should have opened.[/bold cyan]\n"
+            "If not, open this URL manually:\n"
+            f"[dim]{auth_url}[/dim]\n"
+        )
 
-    # Run server in a thread so it doesn't block
-    server_thread = threading.Thread(target=server.handle_request)
+    console.print("[yellow]Waiting for authentication (press Enter to cancel)...[/yellow]")
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    # Wait for callback with timeout
-    print_info("Waiting for GitHub callback...")
-    server_thread.join(timeout=120)  # 2 minute timeout
+    try:
+        # Wait for a callback or user cancellation
+        while not result.received:
+            if not server_thread.is_alive():
+                break
+            # Check if user pressed Enter (non-blocking)
+            import sys, select
+            if sys.stdin in select.select([sys.stdin], [], [], 0.5)[0]:
+                sys.stdin.readline()  # discard the Enter
+                print_info("Cancelled by user.")
+                return
+    except KeyboardInterrupt:
+        print_info("\nCancelled by user.")
+        return
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=5)
 
-    code  = CallbackHandler.code
-    state_returned = CallbackHandler.state
-
-    if not code:
-        print_error("Login timed out. Please try again.")
+    if not result.received or not result.access_token:
+        print_error("Login did not complete. Please try again.")
         return
 
     # Validate state (CSRF protection)
-    if state_returned != state:
-        print_error("State mismatch. Possible CSRF attack. Aborting.")
+    if result.state != state:
+        print_error("State mismatch – possible CSRF attack. Aborting login.")
         return
 
-    # Exchange code + code_verifier with backend
-    with Loader("Completing authentication..."):
-        try:
-            response = requests.post(
-                f"{API_URL}/auth/cli/callback",
-                json={
-                    "code"         : code,
-                    "code_verifier": code_verifier,
-                    "state"        : state_returned
-                },
-                timeout=30
-            )
-        except requests.exceptions.RequestException as e:
-            print_error(f"Connection error: {e}")
-            return
-
-    if response.status_code != 200:
-        print_error("Authentication failed. Please try again.")
-        return
-
-    data = response.json()
-
-    # Save credentials locally
+    # Persist credentials
     save_credentials(
-        access_token  = data["access_token"],
-        refresh_token = data["refresh_token"],
-        user          = data["user"]
+        access_token=result.access_token,
+        refresh_token=result.refresh_token,
+        user=result.user,
     )
 
-    username = data["user"].get("username", "unknown")
+    username = result.user.get("username", "unknown")
     print_success(f"Logged in as @{username}")
 
 
@@ -273,26 +298,23 @@ def login():
 @click.command()
 def logout():
     """Logout and clear stored credentials."""
-
     if not is_logged_in():
         print_error("You are not logged in.")
         return
 
     refresh_token = get_refresh_token()
 
-    # Tell backend to revoke the refresh token
     if refresh_token:
         with Loader("Logging out..."):
             try:
                 requests.post(
                     f"{API_URL}/auth/logout",
                     json={"refresh_token": refresh_token},
-                    timeout=10
+                    timeout=10,
                 )
             except requests.exceptions.RequestException:
-                pass  # Even if backend call fails, were gonna clear local credentials
+                pass  # Clear locally even if backend call fails
 
-    # Clear local credentials
     clear_credentials()
     print_success("Logged out successfully.")
 
@@ -303,8 +325,7 @@ def logout():
 
 @click.command()
 def whoami():
-    """Show the currently logged in user."""
-
+    """Show the currently logged-in user."""
     if not is_logged_in():
         print_error("You are not logged in. Run: insighta login")
         return
