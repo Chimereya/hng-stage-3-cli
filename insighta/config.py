@@ -9,8 +9,7 @@ CREDENTIALS_DIR  = Path.home() / ".insighta"
 CREDENTIALS_FILE = CREDENTIALS_DIR / "credentials.json"
 
 
-API_URL = "https://hng-stage-3-backend-git-feat-stage-3-chimereyas-projects.vercel.app"
-
+API_URL = "https://hng-stage-3-backend.vercel.app"
 
 
 
