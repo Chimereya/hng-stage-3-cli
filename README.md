@@ -196,15 +196,6 @@ insighta profiles search "senior women in the US"
 insighta profiles search "adults between 30 and 40"
 ```
 
-
-## Environment Variables
-The CLI reads INSIGHTA_API_URL if set, otherwise defaults to the production backend:
-
-```
-export INSIGHTA_API_URL="https://hng-stage-3-backend.vercel.app"
-```
-
-
 ## Credentials File
 Stored at ~/.insighta/credentials.json:
 ```
