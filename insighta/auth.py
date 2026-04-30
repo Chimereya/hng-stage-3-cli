@@ -5,7 +5,6 @@ import webbrowser
 import hashlib
 import base64
 import secrets
-import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -34,10 +33,9 @@ from .display import (
 # ──────────────────────────────────────────
 
 def generate_pkce_pair():
-    """Generate a code_verifier and code_challenge pair (PKCE S256)."""
-    import string
-    allowed_chars = string.ascii_letters + string.digits + '._~-'
-    code_verifier = ''.join(secrets.choice(allowed_chars) for _ in range(43))
+    # code_verifier: random 32 bytes, base64url-encoded = 43 chars
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    # code_challenge: SHA256(code_verifier), base64url-encoded = 43 chars
     code_challenge = (
         base64.urlsafe_b64encode(
             hashlib.sha256(code_verifier.encode()).digest()
@@ -49,18 +47,17 @@ def generate_pkce_pair():
 
 
 # ──────────────────────────────────────────
-# TOKEN EXCHANGE
+# TOKEN EXCHANGE (PKCE)
 # ──────────────────────────────────────────
 
 def exchange_code_for_tokens(code: str, code_verifier: str) -> dict | None:
-    """Exchange authorization code for access tokens using PKCE."""
     try:
+        print(f"DEBUG exchange: code={code}, verifier={code_verifier[:10]}...")
         response = requests.post(
-            f"{API_URL}/auth/token",
+            f"{API_URL}/auth/cli/callback",
             json={
                 "code": code,
                 "code_verifier": code_verifier,
-                "grant_type": "authorization_code",
             },
             timeout=10,
         )
@@ -69,7 +66,17 @@ def exchange_code_for_tokens(code: str, code_verifier: str) -> dict | None:
         return None
     except requests.exceptions.RequestException:
         return None
-    """Try to refresh the access token using the stored refresh token."""
+
+
+# ──────────────────────────────────────────
+# TOKEN REFRESH
+# ──────────────────────────────────────────
+
+def refresh_access_token() -> bool:
+    """
+    Try to refresh the access token using the stored refresh token.
+    Returns True if successful, False if the session cannot be recovered.
+    """
     refresh_token = get_refresh_token()
     if not refresh_token:
         return False
@@ -137,33 +144,26 @@ def make_request(method: str, endpoint: str, **kwargs) -> requests.Response:
 
 
 # ──────────────────────────────────────────
-# LOCAL CALLBACK SERVER (thread‑safe)
+# LOCAL CALLBACK SERVER (thread-safe)
 # ──────────────────────────────────────────
 
 class CallbackResult:
-    """Thread‑safe container for OAuth callback data."""
+    """Thread-safe container for the OAuth callback data."""
     def __init__(self):
         self.lock = threading.Lock()
-        self.access_token = None
-        self.refresh_token = None
-        self.state = None
-        self.user = {}
+        self.code = None    # authorization code from GitHub
+        self.state = None   # state for CSRF verification
         self.received = False
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
-    """
-    Temporary local HTTP server that catches the GitHub OAuth callback
-    and extracts the tokens forwarded by the backend in the redirect URL.
-    """
-    # These class attributes will be set before server start
+    
     result: CallbackResult = None
     expected_state: str = None
 
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        # Only process /callback; ignore other requests
         if parsed.path != "/callback":
             self.send_response(204)
             self.end_headers()
@@ -172,18 +172,10 @@ class CallbackHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         with CallbackHandler.result.lock:
+            CallbackHandler.result.code = params.get("code", [None])[0]
             CallbackHandler.result.state = params.get("state", [None])[0]
-            CallbackHandler.result.access_token = params.get("access_token", [None])[0]
-            CallbackHandler.result.refresh_token = params.get("refresh_token", [None])[0]
-            CallbackHandler.result.user = {
-                "username": params.get("username", [None])[0],
-                "email": params.get("email", [None])[0],
-                "role": params.get("role", [None])[0],
-                "avatar_url": params.get("avatar_url", [None])[0],
-            }
             CallbackHandler.result.received = True
 
-        # Send a nice response to the browser
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
@@ -212,20 +204,18 @@ def login():
         print_info("Run 'insighta logout' first to switch accounts.")
         return
 
-    # Generate PKCE + state
     code_verifier, code_challenge = generate_pkce_pair()
     state = secrets.token_urlsafe(32)
 
-    # Prepare thread‑safe result container
     result = CallbackResult()
     CallbackHandler.result = result
+    CallbackHandler.expected_state = state
 
     PORT = 8484
     server = HTTPServer(("localhost", PORT), CallbackHandler)
-    server.socket.settimeout(1.0)  # Low timeout so we can check for shutdown frequently
+    server.socket.settimeout(1.0)
     server.timeout = 1.0
 
-    # Build the auth URL (backend must support source=cli and PKCE)
     query_params = {
         "source": "cli",
         "state": state,
@@ -234,7 +224,6 @@ def login():
     }
     auth_url = f"{API_URL}/auth/github?{urlencode(query_params)}"
 
-    # Try to open in browser; if fails, print the URL clearly
     opened = webbrowser.open(auth_url)
     if not opened:
         print_info("Could not open browser automatically.")
@@ -254,14 +243,12 @@ def login():
     server_thread.start()
 
     try:
-        # Wait for a callback or user cancellation
         while not result.received:
             if not server_thread.is_alive():
                 break
-            # Check if user pressed Enter (non-blocking)
             import sys, select
             if sys.stdin in select.select([sys.stdin], [], [], 0.5)[0]:
-                sys.stdin.readline()  # discard the Enter
+                sys.stdin.readline()
                 print_info("Cancelled by user.")
                 return
     except KeyboardInterrupt:
@@ -271,23 +258,29 @@ def login():
         server.shutdown()
         server_thread.join(timeout=5)
 
-    if not result.received or not result.access_token:
+    if not result.received or not result.code:
         print_error("Login did not complete. Please try again.")
         return
 
-    # Validate state (CSRF protection)
     if result.state != state:
         print_error("State mismatch – possible CSRF attack. Aborting login.")
         return
 
-    # Persist credentials
+ 
+    print_info("Completing authentication...")
+    token_data = exchange_code_for_tokens(result.code, code_verifier)
+
+    if not token_data or token_data.get("status") != "success":
+        print_error("Token exchange failed. Please try again.")
+        return
+
     save_credentials(
-        access_token=result.access_token,
-        refresh_token=result.refresh_token,
-        user=result.user,
+        access_token=token_data["access_token"],
+        refresh_token=token_data["refresh_token"],
+        user=token_data.get("user", {}),
     )
 
-    username = result.user.get("username", "unknown")
+    username = token_data.get("user", {}).get("username", "unknown")
     print_success(f"Logged in as @{username}")
 
 
