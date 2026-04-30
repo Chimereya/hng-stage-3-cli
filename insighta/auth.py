@@ -194,6 +194,15 @@ class CallbackHandler(BaseHTTPRequestHandler):
 # LOGIN COMMAND
 # ──────────────────────────────────────────
 
+import sys
+import time
+import secrets
+import threading
+import webbrowser
+from urllib.parse import urlencode
+from http.server import HTTPServer
+import click
+
 @click.command()
 def login():
     """Login to Insighta via GitHub OAuth."""
@@ -246,11 +255,26 @@ def login():
         while not result.received:
             if not server_thread.is_alive():
                 break
-            import sys, select
-            if sys.stdin in select.select([sys.stdin], [], [], 0.5)[0]:
-                sys.stdin.readline()
-                print_info("Cancelled by user.")
-                return
+            
+            # WINDOWS: Use msvcrt because select() only works on sockets
+            if sys.platform == "win32":
+                import msvcrt
+                if msvcrt.kbhit():
+                    # Read the character to clear the buffer
+                    char = msvcrt.getch()
+                    if char in [b'\r', b'\n']:
+                        print_info("Cancelled by user.")
+                        return
+            
+            else:
+                import select
+                if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                    sys.stdin.readline()
+                    print_info("Cancelled by user.")
+                    return
+            
+            time.sleep(0.1)  # Minimal sleep to prevent high CPU usage
+
     except KeyboardInterrupt:
         print_info("\nCancelled by user.")
         return
@@ -266,7 +290,6 @@ def login():
         print_error("State mismatch – possible CSRF attack. Aborting login.")
         return
 
- 
     print_info("Completing authentication...")
     token_data = exchange_code_for_tokens(result.code, code_verifier)
 
@@ -282,7 +305,6 @@ def login():
 
     username = token_data.get("user", {}).get("username", "unknown")
     print_success(f"Logged in as @{username}")
-
 
 # ──────────────────────────────────────────
 # LOGOUT COMMAND
