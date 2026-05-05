@@ -22,6 +22,7 @@ def cli():
     insighta profiles search "young males from nigeria"
     insighta profiles create --name "Harriet Tubman"
     insighta profiles export --format csv
+    insighta profiles upload ./my_profiles.csv
     """
     pass
 
