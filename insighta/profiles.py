@@ -165,3 +165,63 @@ def export(fmt, gender, country, age_group):
         f.write(resp.text)
 
     print_success(f"Exported to {filename}")
+
+
+
+@profiles.command()
+@click.argument("filepath", type=click.Path(exists=True, readable=True, dir_okay=False))
+def upload(filepath):
+    """Upload profiles from a CSV file (admin only)."""
+    if not is_logged_in():
+        print_error("You are not logged in. Run: insighta login")
+        return
+
+    if not filepath.endswith(".csv"):
+        print_error("Only .csv files are accepted.")
+        return
+
+    with open(filepath, "rb") as f:
+        file_bytes = f.read()
+
+    filename = os.path.basename(filepath)
+    file_size_kb = len(file_bytes) / 1024
+    print_info(f"Uploading {filename} ({file_size_kb:.1f} KB)...")
+
+    with Loader("Uploading profiles..."):
+        resp = make_request(
+            "POST",
+            "/api/profiles/upload",
+            files={"file": (filename, file_bytes, "text/csv")},
+        )
+
+    if resp.status_code in (200, 207):
+        data = resp.json()
+
+        inserted  = data.get("inserted", 0)
+        skipped   = data.get("skipped", 0)
+        total     = data.get("total_rows", 0)
+        reasons   = data.get("reasons", {})
+        is_partial = data.get("status") == "partial"
+
+        if is_partial:
+            print_error(f"Upload partially completed: {data.get('message', '')}")
+        else:
+            print_success("Upload complete.")
+
+        console.print(
+            f"\n  [bold cyan]Total rows:[/bold cyan]  {total}\n"
+            f"  [bold green]Inserted:[/bold green]    {inserted}\n"
+            f"  [bold yellow]Skipped:[/bold yellow]     {skipped}"
+        )
+
+        if reasons:
+            console.print("\n  [bold white]Skip reasons:[/bold white]")
+            for reason, count in reasons.items():
+                console.print(f"    [dim]•[/dim] {reason}: [yellow]{count}[/yellow]")
+
+    elif resp.status_code == 403:
+        print_error("You do not have permission to upload profiles (admin only).")
+    elif resp.status_code == 400:
+        print_error(resp.json().get("message", "Bad request."))
+    else:
+        print_error(resp.json().get("message", "Upload failed."))
